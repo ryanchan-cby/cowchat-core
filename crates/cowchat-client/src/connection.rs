@@ -2674,6 +2674,9 @@ impl CowchatClient {
         .await
     }
 
+    /// As [`Self::create_subscription`], delivering only messages carrying one of
+    /// `tags` (`key` or `key=value`). An empty list delivers every message.
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_tagged_subscription(
         &self,
         room_id: &str,
