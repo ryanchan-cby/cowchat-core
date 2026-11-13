@@ -330,6 +330,114 @@ mod tests {
     /// The debug diagnostic must never carry a payload. `create_invite`'s reply
     /// contains a live `cinv_…` token, and `RUST_LOG=debug` output reaches CI logs
     /// and agent transcripts — the exact channel the invite-hygiene work closes.
+    /// Truncation marks exactly the values it shortened, counted after escaping.
+    #[test]
+    fn the_frame_diagnostic_marks_only_truncated_values() {
+        let newlines = format!(r#"{{"type":"{}"}}"#, "\\n".repeat(40));
+        let rendered = super::render_frame_diagnostic(&newlines);
+        assert!(
+            rendered.contains('…'),
+            "80 escaped chars were cut: {rendered}"
+        );
+
+        let short = r#"{"type":"éééééééééééééééééééééééééééééé"}"#;
+        let rendered = super::render_frame_diagnostic(short);
+        assert!(!rendered.contains('…'), "30 chars fit in 64: {rendered}");
+    }
+
+    /// A malformed error payload keeps its message and never reads as a genuine
+    /// `InternalError`.
+    #[test]
+    fn decode_error_payload_never_invents_internal_error() {
+        let missing = super::decode_error_payload(serde_json::json!({"message": "slow down"}));
+        assert_eq!(missing.code, ErrorCode::Unknown);
+        assert_eq!(missing.message, "slow down");
+
+        let numeric =
+            super::decode_error_payload(serde_json::json!({"code": 5, "message": "slow down"}));
+        assert_eq!(numeric.code, ErrorCode::Unknown);
+        assert_eq!(numeric.message, "slow down");
+
+        let bare = super::decode_error_payload(serde_json::json!({"code": 5}));
+        assert_eq!(bare.code, ErrorCode::Unknown);
+        assert!(!bare.message.is_empty());
+
+        let unknown_code = super::decode_error_payload(
+            serde_json::json!({"code": "quota_exhausted", "message": "upgrade"}),
+        );
+        assert_eq!(unknown_code.code, ErrorCode::Unknown);
+        assert_eq!(unknown_code.message, "upgrade");
+    }
+
+    /// An unsolicited event of a type this build does not know reaches
+    /// subscribers as `FrameType::Unknown`, and the connection keeps working.
+    #[tokio::test]
+    async fn an_unknown_event_is_delivered_and_the_connection_stays_usable() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read_half, mut write_half) = tokio::io::split(stream);
+            let mut reader = BufReader::new(read_half);
+            let register = read_frame_line(&mut reader).await.unwrap().unwrap();
+            let register = Frame::from_line(&register).unwrap();
+            let ok = Frame::ok(
+                register.id.as_deref(),
+                serde_json::json!({"agent_id": "probe"}),
+            );
+            write_half
+                .write_all(ok.to_line().unwrap().as_bytes())
+                .await
+                .unwrap();
+
+            let ping = read_frame_line(&mut reader).await.unwrap().unwrap();
+            let ping = Frame::from_line(&ping).unwrap();
+            write_half
+                .write_all(
+                    b"{\"id\":\"evt-1\",\"type\":\"some_future_event\",\"payload\":{\"a\":1}}\n",
+                )
+                .await
+                .unwrap();
+            let pong = Frame {
+                id: Some("s2".into()),
+                reply_to: ping.id.clone(),
+                frame_type: FrameType::Pong,
+                payload: serde_json::json!({}),
+            };
+            write_half
+                .write_all(pong.to_line().unwrap().as_bytes())
+                .await
+                .unwrap();
+        });
+
+        let client = CowchatClient::connect_tcp(
+            &addr.to_string(),
+            "test-key",
+            "client",
+            Some("probe"),
+            vec![],
+        )
+        .await
+        .unwrap();
+        let mut events = client.subscribe();
+        client
+            .ping()
+            .await
+            .expect("the connection survives an unknown event");
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let event = events.recv().await.unwrap();
+                if event.frame.frame_type == FrameType::Unknown {
+                    return event;
+                }
+            }
+        })
+        .await
+        .expect("the unknown event reaches subscribers");
+        assert_eq!(event.frame.id.as_deref(), Some("evt-1"));
+        server.await.unwrap();
+    }
+
     #[test]
     fn the_frame_diagnostic_never_logs_a_payload() {
         // The real create_invite reply shape: the token rides in the payload.
@@ -356,9 +464,13 @@ mod tests {
     /// `type` must not be able to forge a log line or flood the log.
     #[test]
     fn the_frame_diagnostic_neutralises_a_hostile_type() {
-        let line = r#"{"type":"ok
-WARN cowchat: auth failed, key=0f1e2d","id":"x"}"#;
+        // Valid JSON whose decoded `type` contains a newline.
+        let line = r#"{"type":"ok\nWARN cowchat: auth failed, key=0f1e2d","id":"x"}"#;
         let rendered = super::render_frame_diagnostic(line);
+        assert!(
+            rendered.contains(r"type=ok\nWARN cowchat"),
+            "the hostile type must reach the renderer, escaped: {rendered}"
+        );
         assert!(
             !rendered.contains('\n'),
             "a newline in `type` would forge a second log line: {rendered}"
@@ -1269,8 +1381,9 @@ fn render_frame_diagnostic(line: &str) -> String {
     // transcripts. Escaping keeps a crafted `type` from forging a log line;
     // truncation keeps a 1 MiB one from flooding it.
     let safe = |v: String| -> String {
-        let mut out: String = v.escape_debug().take(64).collect();
-        if v.len() > 64 {
+        let mut escaped = v.escape_debug();
+        let mut out: String = escaped.by_ref().take(64).collect();
+        if escaped.next().is_some() {
             out.push('…');
         }
         out
@@ -1601,7 +1714,8 @@ impl CowchatClient {
         if response.frame_type == FrameType::Unknown {
             return Err(ClientError::Server {
                 code: ErrorCode::UnsupportedProtocol,
-                message: "the server replied with a frame type this client does not understand"
+                message: "the server replied with a frame type this client does not \
+                          understand; the request may or may not have taken effect"
                     .into(),
             });
         }
@@ -1864,7 +1978,8 @@ impl CowchatClient {
         if response.frame_type == FrameType::Unknown {
             return Err(ClientError::Server {
                 code: ErrorCode::UnsupportedProtocol,
-                message: "the server replied with a frame type this client does not understand"
+                message: "the server replied with a frame type this client does not \
+                          understand; the request may or may not have taken effect"
                     .into(),
             });
         }
